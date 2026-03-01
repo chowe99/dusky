@@ -68,9 +68,8 @@ main() {
     }
 
     # 4. Cascading Signal Interception
-    # Translates termination signals into precise exit codes, ensuring the EXIT
-    # trap runs deterministically to purge the temp file.
-    trap '[[ -f "${temp_file}" ]] && rm -f "${temp_file}"' EXIT
+    # FIXED: Double quotes force immediate variable expansion before the local scope is destroyed
+    trap "[[ -f \"${temp_file}\" ]] && rm -f \"${temp_file}\"" EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM

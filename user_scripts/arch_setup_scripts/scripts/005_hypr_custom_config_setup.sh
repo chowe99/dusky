@@ -40,6 +40,7 @@ readonly -a CONFIG_FILES=(
     "autostart.conf"
     "plugins.conf"
     "window_rules.conf"
+    "workspace_rules.conf"
     "environment_variables.conf"
     "input.conf"
 )
@@ -300,6 +301,20 @@ EOF
 # These will override or add to the defaults found in ~/.config/hypr/source/window_rules.conf
 # ==============================================================================
 
+EOF
+            ;;
+        "workspace_rules.conf")
+            cat <<'EOF'
+# ==============================================================================
+# USER CONFIGURATION: workspace_rules.conf
+# ==============================================================================
+# Add your custom rules for workspace here.
+# These will override or add to the defaults found in :
+# ~/.config/hypr/source/workspace_rules.conf
+#
+# This file can also be edited with dusky workspace manager tui, 
+# which can be found in dusky control center
+# ==============================================================================
 EOF
             ;;
         "environment_variables.conf")

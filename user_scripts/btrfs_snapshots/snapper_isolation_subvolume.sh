@@ -11,6 +11,8 @@ AUTO_MODE=false
 
 declare -A BACKED_UP=()
 
+SUDO_PID=""
+
 fatal() {
     printf '\033[1;31m[FATAL]\033[0m %s\n' "$1" >&2
     exit 1
@@ -18,6 +20,10 @@ fatal() {
 
 info() {
     printf '\033[1;32m[INFO]\033[0m %s\n' "$1"
+}
+
+warn() {
+    printf '\033[1;33m[WARN]\033[0m %s\n' "$1" >&2
 }
 
 cleanup() {
@@ -28,25 +34,31 @@ trap cleanup EXIT INT TERM
 execute() {
     local desc="$1"
     shift
+
     if [[ "$AUTO_MODE" == true ]]; then
         "$@"
-    else
-        printf '\n\033[1;34m[ACTION]\033[0m %s\n' "$desc"
-        read -r -p "Execute this step? [Y/n] " response || fatal "Input closed; aborting."
-        if [[ "${response,,}" =~ ^(n|no)$ ]]; then
-            info "Skipped."
-            return 0
-        fi
-        "$@"
+        return 0
     fi
+
+    printf '\n\033[1;34m[ACTION]\033[0m %s\n' "$desc"
+    read -r -p "Execute this step? [Y/n] " response || fatal "Input closed; aborting."
+    if [[ "${response,,}" =~ ^(n|no)$ ]]; then
+        info "Skipped."
+        return 0
+    fi
+
+    "$@"
 }
 
 backup_file() {
     local file="$1"
+
     [[ -e "$file" ]] || return 0
     [[ -n "${BACKED_UP["$file"]+x}" ]] && return 0
+
     local stamp
     stamp="$(date +%Y%m%d-%H%M%S)"
+
     sudo cp -a -- "$file" "${file}.bak.${stamp}"
     BACKED_UP["$file"]=1
     info "Backup created: ${file}.bak.${stamp}"
@@ -100,6 +112,7 @@ strip_subvol_opts() {
             joined+=",${kept[i]}"
         done
     fi
+
     printf '%s\n' "$joined"
 }
 
@@ -108,67 +121,145 @@ get_root_source() {
 }
 
 get_root_uuid() {
-    findmnt -no UUID /
+    local source uuid
+
+    uuid="$(findmnt -no UUID / 2>/dev/null || true)"
+    if [[ -n "$uuid" ]]; then
+        printf '%s\n' "$uuid"
+        return 0
+    fi
+
+    source="$(get_root_source)"
+    [[ -n "$source" ]] || return 1
+
+    blkid -s UUID -o value "$source" 2>/dev/null || true
 }
 
 get_root_mount_opts() {
     findmnt -no OPTIONS /
 }
 
+dir_has_entries() {
+    local dir="$1"
+    sudo find "$dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .
+}
+
+path_is_btrfs_subvolume() {
+    local path="$1"
+    sudo btrfs subvolume show "$path" >/dev/null 2>&1
+}
+
+verify_snapshots_mount() {
+    local root_uuid snap_uuid mounted_opts mounted_subvol
+
+    root_uuid="$(get_root_uuid)"
+    [[ -n "$root_uuid" ]] || fatal "Could not determine the Btrfs UUID for /"
+
+    findmnt -M /.snapshots >/dev/null 2>&1 || fatal "/.snapshots is not mounted."
+
+    snap_uuid="$(findmnt -M /.snapshots -no UUID 2>/dev/null || true)"
+    [[ -n "$snap_uuid" ]] || fatal "Could not determine the filesystem UUID for /.snapshots"
+    [[ "$snap_uuid" == "$root_uuid" ]] || fatal "/.snapshots is mounted from a different filesystem."
+
+    mounted_opts="$(findmnt -M /.snapshots -no OPTIONS 2>/dev/null || true)"
+    mounted_subvol="$(extract_subvol "$mounted_opts" || true)"
+    mounted_subvol="${mounted_subvol#/}"
+
+    [[ "$mounted_subvol" == "@snapshots" ]] || fatal "/.snapshots is mounted, but not from subvol=/@snapshots"
+
+    sudo chmod 750 /.snapshots
+    info "/.snapshots is mounted from @snapshots"
+}
+
 install_packages() {
     sudo pacman -S --needed --noconfirm snapper btrfs-progs
+}
+
+post_install_checks() {
+    require_cmd btrfs
+    require_cmd snapper
+    require_cmd systemctl
 }
 
 ensure_root_snapper_config() {
     if sudo snapper -c root get-config >/dev/null 2>&1; then
         info "Snapper root config already exists."
-    else
-        sudo snapper -c root create-config /
-        info "Created Snapper root config."
+        return 0
     fi
+
+    if mountpoint -q /.snapshots; then
+        fatal "Snapper root config is missing, but /.snapshots is already a mountpoint. Refusing automatic recovery."
+    fi
+
+    sudo snapper -c root create-config /
+    sudo snapper -c root get-config >/dev/null 2>&1 || fatal "Snapper root config was not created correctly."
+    info "Created Snapper root config."
 }
 
 ensure_top_level_snapshots_subvolume() {
-    local root_source tmp_mnt
+    local root_source tmp_mnt mounted=false
+
     root_source="$(get_root_source)"
     [[ -n "$root_source" ]] || fatal "Could not determine the root source device."
 
     tmp_mnt="$(mktemp -d)"
-    sudo mount -o subvolid=5 "$root_source" "$tmp_mnt"
+    cleanup_top_level_mount() {
+        if [[ "$mounted" == true ]]; then
+            sudo umount "$tmp_mnt" 2>/dev/null || true
+        fi
+        rmdir "$tmp_mnt" 2>/dev/null || true
+    }
+    trap cleanup_top_level_mount RETURN
 
-    if sudo btrfs subvolume show "${tmp_mnt}/@snapshots" >/dev/null 2>&1; then
-        info "Top-level subvolume @snapshots already exists."
+    sudo mount -o subvolid=5 "$root_source" "$tmp_mnt"
+    mounted=true
+
+    if [[ -e "${tmp_mnt}/@snapshots" ]]; then
+        if sudo btrfs subvolume show "${tmp_mnt}/@snapshots" >/dev/null 2>&1; then
+            info "Top-level subvolume @snapshots already exists."
+        else
+            fatal "Top-level path @snapshots exists, but it is not a Btrfs subvolume."
+        fi
     else
         sudo btrfs subvolume create "${tmp_mnt}/@snapshots"
         info "Created top-level subvolume @snapshots."
     fi
 
-    sudo umount "$tmp_mnt"
-    rmdir "$tmp_mnt"
+    trap - RETURN
+    cleanup_top_level_mount
 }
 
-remove_nested_root_snapshots_subvolume() {
-    sudo umount /.snapshots 2>/dev/null || true
+prepare_snapshots_mountpoint() {
+    sudo mkdir -p /.snapshots
 
-    if sudo btrfs subvolume show /.snapshots >/dev/null 2>&1; then
-        local -a child_ids=()
-        mapfile -t child_ids < <(sudo btrfs subvolume list -o /.snapshots | awk '{print $2}' | sort -rn || true)
-
-        local id
-        for id in "${child_ids[@]}"; do
-            [[ -n "$id" ]] || continue
-            sudo btrfs subvolume delete --subvolid "$id" /
-        done
-
-        sudo btrfs subvolume delete /.snapshots
-        info "Removed nested /.snapshots subvolume."
+    if mountpoint -q /.snapshots; then
+        verify_snapshots_mount
+        return 0
     fi
 
-    sudo mkdir -p /.snapshots
+    if [[ ! -d /.snapshots ]]; then
+        fatal "/.snapshots exists, but it is not a directory."
+    fi
+
+    if path_is_btrfs_subvolume /.snapshots; then
+        if dir_has_entries /.snapshots; then
+            fatal "Nested /.snapshots is a populated Btrfs subvolume. Refusing destructive migration."
+        fi
+
+        sudo btrfs subvolume delete /.snapshots
+        sudo mkdir -p /.snapshots
+        info "Removed empty nested /.snapshots subvolume."
+        return 0
+    fi
+
+    if dir_has_entries /.snapshots; then
+        fatal "/.snapshots is a non-empty directory. Refusing to mount over existing contents."
+    fi
 }
 
 ensure_fstab_entry_for_root_snapshots() {
     local fs_uuid root_opts cleaned_opts mount_opts newline tmp
+
     fs_uuid="$(get_root_uuid)"
     [[ -n "$fs_uuid" ]] || fatal "Could not determine the Btrfs UUID for /"
 
@@ -183,10 +274,11 @@ ensure_fstab_entry_for_root_snapshots() {
 
     backup_file /etc/fstab
     tmp="$(mktemp)"
+
     awk -v mp='/.snapshots' -v newline="$newline" '
         BEGIN { done = 0 }
-        $0 ~ /^[[:space:]]*#/ { print; next }
-        $2 == mp {
+        /^[[:space:]]*#/ { print; next }
+        NF >= 2 && $2 == mp {
             if (!done) {
                 print newline
                 done = 1
@@ -203,23 +295,27 @@ ensure_fstab_entry_for_root_snapshots() {
 
     sudo install -m 0644 "$tmp" /etc/fstab
     rm -f "$tmp"
+
     sudo systemctl daemon-reload
     info "Ensured /.snapshots entry in /etc/fstab"
 }
 
 mount_root_snapshots() {
     sudo mkdir -p /.snapshots
+
+    if mountpoint -q /.snapshots; then
+        verify_snapshots_mount
+        return 0
+    fi
+
     sudo mount /.snapshots
+    verify_snapshots_mount
+}
 
-    findmnt -M /.snapshots >/dev/null 2>&1 || fatal "Mount of /.snapshots failed."
-    sudo chmod 750 /.snapshots
-
-    local mounted_opts mounted_subvol
-    mounted_opts="$(findmnt -M /.snapshots -no OPTIONS)"
-    mounted_subvol="$(extract_subvol "$mounted_opts" || true)"
-    [[ "$mounted_subvol" == "@snapshots" ]] || fatal "/.snapshots is mounted, but not from subvol=/@snapshots"
-
-    info "/.snapshots is mounted from @snapshots"
+verify_snapper_works() {
+    sudo snapper -c root get-config >/dev/null 2>&1 || fatal "Snapper root config is not usable."
+    sudo snapper -c root list >/dev/null 2>&1 || fatal "Snapper cannot access the root snapshot set."
+    info "Snapper root config is working."
 }
 
 tune_snapper() {
@@ -236,14 +332,18 @@ tune_snapper() {
 }
 
 preflight_checks() {
+    (( EUID != 0 )) || fatal "Run this script as a regular user with sudo privileges, not as root."
+
     require_cmd sudo
     require_cmd pacman
     require_cmd findmnt
     require_cmd mountpoint
-    require_cmd btrfs
-    require_cmd snapper
     require_cmd awk
     require_cmd sed
+    require_cmd grep
+    require_cmd stat
+    require_cmd mktemp
+    require_cmd date
 
     [[ "$(stat -f -c %T /)" == "btrfs" ]] || fatal "Root filesystem is not Btrfs."
 
@@ -260,9 +360,11 @@ preflight_checks() {
 preflight_checks
 
 execute "Install Snapper packages" install_packages
+post_install_checks
 execute "Create Snapper root config" ensure_root_snapper_config
 execute "Create top-level @snapshots subvolume" ensure_top_level_snapshots_subvolume
-execute "Remove any nested /.snapshots subvolume" remove_nested_root_snapshots_subvolume
+execute "Prepare /.snapshots mountpoint safely" prepare_snapshots_mountpoint
 execute "Write /.snapshots mount to /etc/fstab" ensure_fstab_entry_for_root_snapshots
 execute "Mount /.snapshots from @snapshots" mount_root_snapshots
+execute "Verify Snapper can use the isolated snapshot layout" verify_snapper_works
 execute "Apply Snapper cleanup settings" tune_snapper

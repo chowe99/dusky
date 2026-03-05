@@ -10,6 +10,10 @@ AUTO_MODE=false
 [[ "${1:-}" == "--auto" ]] && AUTO_MODE=true
 
 declare -A BACKED_UP=()
+declare -a EFFECTIVE_HOOKS=()
+
+SUDO_PID=""
+AUR_HOOK_PREEXISTING=false
 
 fatal() {
     printf '\033[1;31m[FATAL]\033[0m %s\n' "$1" >&2
@@ -32,25 +36,31 @@ trap cleanup EXIT INT TERM
 execute() {
     local desc="$1"
     shift
+
     if [[ "$AUTO_MODE" == true ]]; then
         "$@"
-    else
-        printf '\n\033[1;34m[ACTION]\033[0m %s\n' "$desc"
-        read -r -p "Execute this step? [Y/n] " response || fatal "Input closed; aborting."
-        if [[ "${response,,}" =~ ^(n|no)$ ]]; then
-            info "Skipped."
-            return 0
-        fi
-        "$@"
+        return 0
     fi
+
+    printf '\n\033[1;34m[ACTION]\033[0m %s\n' "$desc"
+    read -r -p "Execute this step? [Y/n] " response || fatal "Input closed; aborting."
+    if [[ "${response,,}" =~ ^(n|no)$ ]]; then
+        info "Skipped."
+        return 0
+    fi
+
+    "$@"
 }
 
 backup_file() {
     local file="$1"
+
     [[ -e "$file" ]] || return 0
     [[ -n "${BACKED_UP["$file"]+x}" ]] && return 0
+
     local stamp
     stamp="$(date +%Y%m%d-%H%M%S)"
+
     sudo cp -a -- "$file" "${file}.bak.${stamp}"
     BACKED_UP["$file"]=1
     info "Backup created: ${file}.bak.${stamp}"
@@ -79,6 +89,82 @@ extract_subvol() {
     return 1
 }
 
+join_csv() {
+    local IFS=,
+    printf '%s' "$*"
+}
+
+get_root_source() {
+    findmnt -no SOURCE / | sed 's/\[.*\]//'
+}
+
+get_root_mount_opts() {
+    findmnt -no OPTIONS /
+}
+
+get_root_subvolume_path() {
+    local mount_opts path
+
+    mount_opts="$(get_root_mount_opts)"
+    path="$(extract_subvol "$mount_opts" || true)"
+    if [[ -n "$path" ]]; then
+        printf '%s\n' "$path"
+        return 0
+    fi
+
+    require_cmd btrfs
+    path="$(btrfs subvolume show / 2>/dev/null | awk -F': *' '$1 == "Path" { print $2; exit }' || true)"
+    path="${path#/}"
+
+    case "$path" in
+        ""|"<FS_TREE>"|"/")
+            return 1
+            ;;
+    esac
+
+    printf '%s\n' "$path"
+}
+
+build_btrfs_rootflags() {
+    local opts="$1"
+    local root_subvol="$2"
+    local opt
+    local -a parts=()
+    local -a flags=()
+    local -A seen=()
+
+    if [[ -n "$root_subvol" ]]; then
+        flags+=("subvol=/${root_subvol#/}")
+        seen["subvol"]=1
+    fi
+
+    IFS=',' read -r -a parts <<< "$opts"
+    for opt in "${parts[@]}"; do
+        case "$opt" in
+            rw|ro)
+                ;;
+            subvol=*)
+                ;;
+            subvolid=*)
+                if [[ -z "$root_subvol" && -z "${seen["$opt"]+x}" ]]; then
+                    flags+=("$opt")
+                    seen["$opt"]=1
+                fi
+                ;;
+            compress|compress=*|compress-force=*|nodatacow|nodatasum|ssd|ssd_spread|nossd|space_cache|space_cache=*|nospace_cache|clear_cache|autodefrag|noautodefrag|discard|discard=*|nodiscard|degraded|commit=*|thread_pool=*|user_subvol_rm_allowed|acl|noacl|rescue=*|flushoncommit|noflushoncommit|metadata_ratio=*|relatime|norelatime|noatime|strictatime|lazytime|nolazytime|device=*)
+                if [[ -z "${seen["$opt"]+x}" ]]; then
+                    flags+=("$opt")
+                    seen["$opt"]=1
+                fi
+                ;;
+        esac
+    done
+
+    if ((${#flags[@]} > 0)); then
+        join_csv "${flags[@]}"
+    fi
+}
+
 collect_mkinitcpio_files() {
     local -a files=("/etc/mkinitcpio.conf")
     local file
@@ -92,41 +178,29 @@ collect_mkinitcpio_files() {
     printf '%s\n' "${files[@]}"
 }
 
-find_last_hooks_file() {
-    local file line last_file=""
-    while IFS= read -r file; do
-        [[ -f "$file" ]] || continue
-        while IFS= read -r line; do
-            [[ "$line" =~ ^[[:space:]]*HOOKS[[:space:]]*= ]] && last_file="$file"
-        done < "$file"
-    done < <(collect_mkinitcpio_files)
-
-    [[ -n "$last_file" ]] || return 1
-    printf '%s\n' "$last_file"
-}
-
-EFFECTIVE_HOOKS=()
-
 get_effective_hooks() {
-    local hooks_file hooks_line contents
-    hooks_file="$(find_last_hooks_file)" || fatal "Could not find an active HOOKS= line in mkinitcpio config."
-
-    hooks_line="$(grep -E '^[[:space:]]*HOOKS[[:space:]]*=' "$hooks_file" | tail -n1 || true)"
-    [[ -n "$hooks_line" ]] || fatal "Could not read HOOKS= from $hooks_file"
-
-    if [[ "$hooks_line" =~ ^[[:space:]]*HOOKS[[:space:]]*=[[:space:]]*\((.*)\)[[:space:]]*$ ]]; then
-        contents="${BASH_REMATCH[1]}"
-    else
-        fatal "Unsupported HOOKS= format in $hooks_file"
-    fi
+    local -a files=()
+    mapfile -t files < <(collect_mkinitcpio_files)
 
     EFFECTIVE_HOOKS=()
-    read -r -a EFFECTIVE_HOOKS <<< "$contents"
+    mapfile -t EFFECTIVE_HOOKS < <(
+        env -i PATH="$PATH" LC_ALL=C bash -O nullglob -c '
+            set -e
+            for f in "$@"; do
+                [[ -f "$f" ]] || continue
+                source "$f"
+            done
+            printf "%s\n" "${HOOKS[@]}"
+        ' bash "${files[@]}"
+    )
+
+    ((${#EFFECTIVE_HOOKS[@]} > 0)) || fatal "Could not determine the effective mkinitcpio HOOKS array."
 }
 
 hook_present() {
     local needle="$1"
     local hook
+
     for hook in "${EFFECTIVE_HOOKS[@]}"; do
         [[ "$hook" == "$needle" ]] && return 0
     done
@@ -134,21 +208,19 @@ hook_present() {
 }
 
 detect_esp_mountpoint() {
-    # 1. Prefer bootctl as recommended by Arch Wiki
     if command -v bootctl >/dev/null 2>&1; then
         local esp
         esp="$(bootctl --print-esp-path 2>/dev/null || true)"
-        if [[ -n "$esp" ]]; then
+        if [[ -n "$esp" && -d "$esp" ]]; then
             printf '%s\n' "$esp"
             return 0
         fi
     fi
 
-    # 2. Fallback loop for manual discovery
     local candidate fstype
     for candidate in /efi /boot /boot/efi; do
         if mountpoint -q "$candidate"; then
-            fstype="$(findmnt -M "$candidate" -no FSTYPE)"
+            fstype="$(findmnt -M "$candidate" -no FSTYPE 2>/dev/null || true)"
             case "$fstype" in
                 vfat|fat|msdos)
                     printf '%s\n' "$candidate"
@@ -157,7 +229,18 @@ detect_esp_mountpoint() {
             esac
         fi
     done
+
     return 1
+}
+
+get_mount_partuuid() {
+    local mountpoint="$1"
+    local source
+
+    source="$(findmnt -M "$mountpoint" -no SOURCE 2>/dev/null || true)"
+    [[ -n "$source" ]] || return 1
+
+    blkid -s PARTUUID -o value "$source" 2>/dev/null || true
 }
 
 set_shell_var() {
@@ -165,6 +248,7 @@ set_shell_var() {
     local key="$2"
     local value="$3"
     local escaped_value
+
     escaped_value="${value//\\/\\\\}"
     escaped_value="${escaped_value//&/\\&}"
     escaped_value="${escaped_value//|/\\|}"
@@ -178,6 +262,42 @@ set_shell_var() {
     fi
 }
 
+dep_satisfied() {
+    local dep="$1"
+    [[ -z "$(pacman -T "$dep" 2>/dev/null || true)" ]]
+}
+
+choose_java_provider() {
+    local pkg
+
+    for pkg in jdk-openjdk jdk21-openjdk; do
+        if pacman -Si "$pkg" >/dev/null 2>&1; then
+            printf '%s\n' "$pkg"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+ensure_aur_build_prereqs() {
+    local need_java=false
+    local dep provider
+
+    for dep in 'java-runtime>=21' 'java-environment>=21'; do
+        if ! dep_satisfied "$dep"; then
+            need_java=true
+            break
+        fi
+    done
+
+    [[ "$need_java" == true ]] || return 0
+
+    provider="$(choose_java_provider)" || fatal "A Java provider for java-environment>=21 is required, but no suitable repo package was found."
+    info "Installing $provider to satisfy Java build dependencies for the AUR package."
+    sudo pacman -S --needed --noconfirm "$provider"
+}
+
 install_kernel_headers_if_needed() {
     local has_dkms=false
     local moddir pkgbase headers_pkg
@@ -188,10 +308,10 @@ install_kernel_headers_if_needed() {
     [[ "$has_dkms" == true ]] || return 0
 
     moddir="/usr/lib/modules/$(uname -r)"
-    [[ -r "${moddir}/pkgbase" ]] || {
+    if [[ ! -r "${moddir}/pkgbase" ]]; then
         warn "DKMS detected, but ${moddir}/pkgbase was not found. Skipping header auto-install."
         return 0
-    }
+    fi
 
     pkgbase="$(<"${moddir}/pkgbase")"
     headers_pkg="${pkgbase}-headers"
@@ -220,42 +340,62 @@ install_repo_packages() {
 }
 
 install_aur_packages() {
+    AUR_HOOK_PREEXISTING=false
+    pacman -Q limine-mkinitcpio-hook >/dev/null 2>&1 && AUR_HOOK_PREEXISTING=true
+
+    if ! command -v paru >/dev/null 2>&1 && ! command -v yay >/dev/null 2>&1; then
+        if [[ "$AUR_HOOK_PREEXISTING" == true ]]; then
+            info "limine-mkinitcpio-hook is already installed."
+            return 0
+        fi
+        fatal "No supported AUR helper found. Install paru or yay first."
+    fi
+
+    ensure_aur_build_prereqs
+
     if command -v paru >/dev/null 2>&1; then
         paru -S --needed --noconfirm --skipreview limine-mkinitcpio-hook
-    elif command -v yay >/dev/null 2>&1; then
+    else
         yay -S --needed --noconfirm \
             --answerdiff None \
             --answerclean None \
             --answeredit None \
             limine-mkinitcpio-hook
-    else
-        fatal "No supported AUR helper found. Install paru or yay first."
     fi
 }
 
 configure_cmdline() {
-    local root_source mount_opts root_subvol
+    require_cmd btrfs
+
+    local root_source root_type mount_opts root_subvol rootflags
     local mapper_name backing_dev luks_uuid root_uuid
-    local kernel_cmdline tmp
+    local kernel_cmdline tmp img
+    local -a ucode_imgs=()
 
     get_effective_hooks
 
-    root_source="$(findmnt -no SOURCE / | sed 's/\[.*\]//')"
-    mount_opts="$(findmnt -no OPTIONS /)"
-    root_subvol="$(extract_subvol "$mount_opts" || true)"
+    root_source="$(get_root_source)"
+    [[ -n "$root_source" ]] || fatal "Could not determine the root source device."
+
+    root_type="$(lsblk -no TYPE "$root_source" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)"
+    mount_opts="$(get_root_mount_opts)"
+    root_subvol="$(get_root_subvolume_path || true)"
+    rootflags="$(build_btrfs_rootflags "$mount_opts" "$root_subvol")"
 
     kernel_cmdline="rw rootfstype=btrfs"
 
-    if [[ -n "$root_subvol" ]]; then
-        kernel_cmdline+=" rootflags=subvol=/${root_subvol#/}"
+    if [[ -n "$rootflags" ]]; then
+        kernel_cmdline+=" rootflags=${rootflags}"
     fi
 
-    if [[ "$root_source" == /dev/mapper/* ]]; then
-        mapper_name="${root_source##*/}"
-        backing_dev="$(sudo cryptsetup status "$root_source" | awk '$1 == "device:" { print $2 }')"
-        [[ -n "$backing_dev" ]] || fatal "Root is mapped, but the backing LUKS device could not be determined."
+    if [[ "$root_type" == "crypt" ]]; then
+        require_cmd cryptsetup
 
-        luks_uuid="$(sudo blkid -s UUID -o value "$backing_dev" || true)"
+        mapper_name="${root_source##*/}"
+        backing_dev="$(sudo cryptsetup status "$root_source" 2>/dev/null | awk '$1 == "device:" { print $2 }' || true)"
+        [[ -n "$backing_dev" ]] || fatal "Root is on dm-crypt, but the backing LUKS device could not be determined."
+
+        luks_uuid="$(sudo blkid -s UUID -o value "$backing_dev" 2>/dev/null || true)"
         [[ -n "$luks_uuid" ]] || fatal "Could not determine the LUKS UUID for $backing_dev"
 
         if hook_present sd-encrypt; then
@@ -263,20 +403,20 @@ configure_cmdline() {
         elif hook_present encrypt; then
             kernel_cmdline+=" cryptdevice=UUID=${luks_uuid}:${mapper_name} root=/dev/mapper/${mapper_name}"
         else
-            fatal "Root is on LUKS, but mkinitcpio has neither encrypt nor sd-encrypt in HOOKS."
+            fatal "Root is on dm-crypt, but mkinitcpio has neither encrypt nor sd-encrypt in HOOKS."
         fi
     else
-        root_uuid="$(findmnt -no UUID / || true)"
-        [[ -n "$root_uuid" ]] || root_uuid="$(sudo blkid -s UUID -o value "$root_source" || true)"
+        root_uuid="$(findmnt -no UUID / 2>/dev/null || true)"
+        [[ -n "$root_uuid" ]] || root_uuid="$(sudo blkid -s UUID -o value "$root_source" 2>/dev/null || true)"
         [[ -n "$root_uuid" ]] || fatal "Could not determine the Btrfs UUID for root."
         kernel_cmdline+=" root=UUID=${root_uuid}"
     fi
 
     if ! hook_present microcode; then
         shopt -s nullglob
-        local -a ucode_imgs=(/boot/*-ucode.img)
+        ucode_imgs=(/boot/*-ucode.img)
         shopt -u nullglob
-        local img
+
         for img in "${ucode_imgs[@]}"; do
             kernel_cmdline+=" initrd=/$(basename "$img")"
         done
@@ -311,99 +451,127 @@ configure_limine_defaults() {
         sudo touch "$limine_defaults"
     fi
 
-    esp_target="$(detect_esp_mountpoint)" || fatal "Could not detect a mounted ESP at /efi, /boot, or /boot/efi."
+    esp_target="$(detect_esp_mountpoint)" || fatal "Could not detect a mounted ESP."
 
     backup_file "$limine_defaults"
     set_shell_var "$limine_defaults" ESP_PATH "$esp_target"
     info "Configured ESP_PATH=${esp_target} in $limine_defaults"
 }
 
-get_boot_entries_for_loader() {
-    local needle="$1"
-    sudo efibootmgr -v | awk -v needle="$needle" '
-        BEGIN { IGNORECASE=1 }
-        $0 ~ /^Boot[0-9A-F]{4}\*/ && index(tolower($0), tolower(needle)) {
-            code = $1
-            sub(/^Boot/, "", code)
-            sub(/\*.*/, "", code)
-            print code
-        }
-    '
+get_boot_entries_for_loader_on_esp() {
+    local loader_path="$1"
+    local esp_partuuid="${2:-}"
+    local line entry_code line_lc loader_lc partuuid_lc
+
+    loader_lc="${loader_path,,}"
+    partuuid_lc="${esp_partuuid,,}"
+
+    sudo efibootmgr -v 2>/dev/null | while IFS= read -r line; do
+        [[ "$line" =~ ^Boot([0-9A-Fa-f]{4})\*?[[:space:]] ]] || continue
+        entry_code="${BASH_REMATCH[1]^^}"
+        line_lc="${line,,}"
+
+        if [[ -n "$partuuid_lc" && "$line_lc" != *"gpt,${partuuid_lc},"* ]]; then
+            continue
+        fi
+        [[ "$line_lc" == *"$loader_lc"* ]] || continue
+
+        printf '%s\n' "$entry_code"
+    done
 }
 
-has_named_limine_nvram_entry() {
-    sudo efibootmgr -v | grep -Eiq '\\EFI\\limine\\limine_x64\.efi'
+has_loader_entry_on_esp() {
+    local loader_path="$1"
+    local esp_partuuid="${2:-}"
+    local -a entries=()
+
+    mapfile -t entries < <(get_boot_entries_for_loader_on_esp "$loader_path" "$esp_partuuid")
+    ((${#entries[@]} > 0))
 }
 
 dedupe_named_limine_entries() {
+    local esp_partuuid="${1:-}"
     local -a entries=()
-    mapfile -t entries < <(get_boot_entries_for_loader '\\efi\\limine\\limine_x64.efi')
+    local keep entry
 
-    if ((${#entries[@]} <= 1)); then
-        return 0
-    fi
+    mapfile -t entries < <(get_boot_entries_for_loader_on_esp '\EFI\limine\limine_x64.efi' "$esp_partuuid")
+    ((${#entries[@]} > 1)) || return 0
 
-    local keep="${entries[0]}"
-    local entry
-    warn "Multiple NVRAM entries point to \\EFI\\limine\\limine_x64.efi. Keeping Boot${keep} and deleting the extras."
+    keep="${entries[0]}"
+    warn "Multiple NVRAM entries point to \\EFI\\limine\\limine_x64.efi on the mounted ESP. Keeping Boot${keep} and deleting the extras."
 
     for entry in "${entries[@]:1}"; do
-        sudo efibootmgr -b "$entry" -B >/dev/null
+        if ! sudo efibootmgr -b "$entry" -B >/dev/null 2>&1; then
+            warn "Failed to delete duplicate entry Boot${entry}."
+        fi
     done
 }
 
 rename_fallback_limine_label() {
+    local esp_partuuid="${1:-}"
     local -a entries=()
-    mapfile -t entries < <(
-        sudo efibootmgr -v | awk '
-            BEGIN { IGNORECASE=1 }
-            $0 ~ /^Boot[0-9A-F]{4}\*/ &&
-            $0 ~ /\\EFI\\BOOT\\BOOTX64\.EFI/ &&
-            $0 ~ /\* Limine([[:space:]]|$)/ {
-                code = $1
-                sub(/^Boot/, "", code)
-                sub(/\*.*/, "", code)
-                print code
-            }
-        '
-    )
-
     local entry
+
+    mapfile -t entries < <(get_boot_entries_for_loader_on_esp '\EFI\BOOT\BOOTX64.EFI' "$esp_partuuid")
+
     for entry in "${entries[@]}"; do
-        sudo efibootmgr -b "$entry" -L "Limine Fallback" >/dev/null
+        if ! sudo efibootmgr -b "$entry" -L "Limine Fallback" >/dev/null 2>&1; then
+            warn "Failed to rename fallback entry Boot${entry}."
+        fi
     done
 }
 
 deploy_limine() {
-    local esp_target
+    local esp_target esp_partuuid
+    local ran_install=false
+    local need_update=false
+
     esp_target="$(detect_esp_mountpoint)" || fatal "Could not detect the ESP mount point."
+    esp_partuuid="$(get_mount_partuuid "$esp_target" || true)"
 
-    dedupe_named_limine_entries
-
-    if [[ ! -f "${esp_target}/EFI/limine/limine_x64.efi" ]] || ! has_named_limine_nvram_entry; then
+    if [[ ! -f "${esp_target}/EFI/limine/limine_x64.efi" ]] || ! has_loader_entry_on_esp '\EFI\limine\limine_x64.efi' "$esp_partuuid"; then
         info "Installing Limine EFI entry."
         sudo limine-install
+        ran_install=true
     else
-        info "Existing Limine EFI entry detected; skipping redundant limine-install."
+        info "Existing Limine EFI entry detected on the mounted ESP; skipping limine-install."
     fi
 
-    sudo limine-update
-    rename_fallback_limine_label
+    if [[ "$AUR_HOOK_PREEXISTING" == true || "$ran_install" == true || ! -f /boot/limine.conf ]]; then
+        need_update=true
+    fi
+
+    if [[ "$need_update" == true ]]; then
+        sudo limine-update
+    else
+        info "limine-mkinitcpio-hook was newly installed and already refreshed Limine; skipping redundant limine-update."
+    fi
+
+    dedupe_named_limine_entries "$esp_partuuid"
+    rename_fallback_limine_label "$esp_partuuid"
 
     [[ -f /boot/limine.conf ]] || fatal "Expected /boot/limine.conf was not created."
-    info "Limine deployment and update completed successfully."
+    info "Limine deployment and EFI entry cleanup completed successfully."
 }
 
 preflight_checks() {
+    (( EUID != 0 )) || fatal "Run this script as a regular user with sudo privileges, not as root."
+
     require_cmd sudo
     require_cmd pacman
     require_cmd findmnt
     require_cmd mountpoint
     require_cmd blkid
+    require_cmd lsblk
     require_cmd awk
     require_cmd sed
+    require_cmd grep
+    require_cmd cmp
+    require_cmd mktemp
+    require_cmd date
 
     [[ -d /sys/firmware/efi ]] || fatal "System is not booted in EFI mode."
+    [[ -f /etc/mkinitcpio.conf ]] || fatal "/etc/mkinitcpio.conf was not found."
     [[ "$(stat -f -c %T /)" == "btrfs" ]] || fatal "Root filesystem is not Btrfs."
 
     sudo -v || fatal "Cannot obtain sudo privileges."
@@ -424,4 +592,4 @@ execute "Configure /etc/default/limine" configure_limine_defaults
 execute "Install limine-mkinitcpio-hook from the AUR" install_aur_packages
 require_cmd limine-install
 require_cmd limine-update
-execute "Deploy and update Limine" deploy_limine
+execute "Deploy and finalize Limine" deploy_limine

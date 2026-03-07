@@ -19,6 +19,7 @@
 SCRIPT_SEARCH_DIRS=(
     "${HOME}/user_scripts/arch_setup_scripts/scripts"
     "${HOME}/user_scripts/arch_setup_scripts"
+    "${HOME}/user_scripts/theme_matugen"
     # "${HOME}/my_other_scripts"
     # "/opt/shared_team_scripts"
 )
@@ -27,7 +28,13 @@ SCRIPT_SEARCH_DIRS=(
 POST_SCRIPT_DELAY=0
 
 INSTALL_SEQUENCE=(
+
+# ------ CUSTOM PATH SCRIPTS -------
 #    "U | deploy_dotfiles.sh --force"
+
+# ------ Setup SCRIPTS -------
+
+
     "U | 005_hypr_custom_config_setup.sh"
     "U | 010_package_removal.sh --auto"
     "U | 015_set_thunar_terminal_kitty.sh"
@@ -125,6 +132,10 @@ INSTALL_SEQUENCE=(
     "U | 470_vesktop_matugen.sh --auto"
     "U | 475_reverting_sleep_timeout.sh"
 
+
+# ------ CUSTOM PATH SCRIPTS -------
+
+    "U | rofi_wallpaper_selctor.sh --cache-only --progress"
 )
 
 # ==============================================================================

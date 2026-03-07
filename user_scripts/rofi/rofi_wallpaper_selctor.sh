@@ -33,6 +33,9 @@ readonly -a MATUGEN_ARGS=(--mode dark)
 declare -ag TEMP_FILES=()
 declare -gi SHOW_FAVORITES=0
 declare -gi FORCE_REBUILD=0
+declare -gi SHOW_PROGRESS=0
+declare -gi CACHE_ONLY=0
+declare -gi PROGRESS_ACTIVE=0
 declare -gi MAX_JOBS=1
 
 log() {
@@ -40,10 +43,14 @@ log() {
   shift
 
   local ts line
+  local progress_active=${PROGRESS_ACTIVE:-0}
+
   printf -v ts '%(%F %T)T' -1
   printf -v line '[%s] [%s] [pid=%s] %s' "$ts" "$level" "$BASHPID" "$*"
 
-  printf '%s\n' "$line" >&2
+  if ((progress_active == 0)); then
+    printf '%s\n' "$line" >&2
+  fi
   { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null || true
 }
 
@@ -140,14 +147,20 @@ acquire_lock() {
 parse_args() {
   while (($#)); do
     case $1 in
-      fav|favorites)
+      fav|favorites|--favorites)
         SHOW_FAVORITES=1
         ;;
-      --rebuild-cache|rebuild-cache)
+      --rebuild-cache|rebuild-cache|--regenerate|regenerate)
         FORCE_REBUILD=1
         ;;
+      --progress|-p)
+        SHOW_PROGRESS=1
+        ;;
+      --cache-only|cache-only|--no-menu|no-menu)
+        CACHE_ONLY=1
+        ;;
       -h|--help)
-        printf 'Usage: %s [fav|favorites] [--rebuild-cache]\n' "$SCRIPT_NAME"
+        printf 'Usage: %s [fav|favorites] [--rebuild-cache|--regenerate] [--progress|-p] [--cache-only|--no-menu]\n' "$SCRIPT_NAME"
         exit 0
         ;;
       *)
@@ -162,7 +175,7 @@ check_dependencies() {
   local -a missing=()
   local cmd
 
-  for cmd in rofi swww magick matugen uwsm-app setsid flock sha256sum find sort xargs cmp stat nproc; do
+  for cmd in rofi swww magick matugen uwsm-app setsid flock sha256sum find sort xargs cmp stat nproc gawk; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
 
@@ -182,6 +195,7 @@ initialize_runtime() {
 validate_config() {
   [[ -d "$WALLPAPER_DIR" ]] || die "Wallpaper directory not found." "$WALLPAPER_DIR"
   [[ -r "$WALLPAPER_DIR" ]] || die "Wallpaper directory is not readable." "$WALLPAPER_DIR"
+  [[ -x "$WALLPAPER_DIR" ]] || die "Wallpaper directory is not searchable." "$WALLPAPER_DIR"
 
   mkdir -p -- \
     "$CACHE_DIR" \
@@ -217,6 +231,7 @@ is_supported_rel_path() {
   [[ $rel != *$'\n'* ]] || return 1
   [[ $rel != *$'\r'* ]] || return 1
   [[ $rel != *$'\t'* ]] || return 1
+  [[ $rel != *$'\x1f'* ]] || return 1
   [[ ! $rel =~ (^|/)\.\.(/|$) ]] || return 1
 }
 
@@ -307,7 +322,7 @@ generate_thumb_safe() {
   generate_thumb "$1" || true
 }
 
-export WALLPAPER_DIR THUMB_DIR THUMB_SIZE LOG_FILE
+export WALLPAPER_DIR THUMB_DIR THUMB_SIZE LOG_FILE PROGRESS_ACTIVE
 export -f log log_output is_supported_rel_path thumb_path generate_thumb generate_thumb_safe
 
 cleanup_orphan_thumbs() {
@@ -336,6 +351,7 @@ build_cache() {
   local -a valid_rels=()
   local file rel thumb
   local -i skipped=0
+  local -i render_progress=0
 
   scan_tmp=$(mktemp --tmpdir="$CACHE_DIR" scan.tmp.XXXXXX)
   state_tmp=$(mktemp --tmpdir="$CACHE_DIR" source.state.tmp.XXXXXX)
@@ -388,9 +404,43 @@ build_cache() {
     return 1
   fi
 
-  if ! printf '%s\0' "${valid_files[@]}" |
-    xargs -0 -r -n 1 -P "$MAX_JOBS" bash -c 'set -Eeuo pipefail; generate_thumb_safe "$1"' _; then
-    die "Thumbnail worker failed unexpectedly."
+  ((SHOW_PROGRESS)) && [[ -t 2 ]] && render_progress=1
+
+  if ((render_progress)); then
+    printf '\n' >&2
+    PROGRESS_ACTIVE=1
+
+    if ! printf '%s\0' "${valid_files[@]}" |
+      xargs -0 -r -n 1 -P "$MAX_JOBS" bash -c '
+        set -Eeuo pipefail
+        generate_thumb_safe "$1" >/dev/null
+        printf "%s\n" "."
+      ' _ |
+      gawk -v total="${#valid_files[@]}" '
+        BEGIN { start = systime() }
+        {
+          c++
+          p = int((c / total) * 100)
+          e = systime() - start
+          eta = (c > 0 && e > 0) ? (total - c) / (c / e) : 0
+          bars = int(p / 2)
+          str = sprintf("%*s", bars, "")
+          gsub(/ /, "#", str)
+          printf "\r\033[K[\033[32m%-50s\033[0m] %d%% (%d/%d) ETA: %ds", str, p, c, total, eta
+          fflush()
+        }
+        END { print "\n\nCache generation complete." }
+      ' >&2; then
+      PROGRESS_ACTIVE=0
+      die "Thumbnail worker failed unexpectedly."
+    fi
+
+    PROGRESS_ACTIVE=0
+  else
+    if ! printf '%s\0' "${valid_files[@]}" |
+      xargs -0 -r -n 1 -P "$MAX_JOBS" bash -c 'set -Eeuo pipefail; generate_thumb_safe "$1"' _; then
+      die "Thumbnail worker failed unexpectedly."
+    fi
   fi
 
   : >"$cache_tmp"
@@ -411,10 +461,11 @@ build_cache() {
   if ((skipped > 0)); then
     notify \
       "Skipped unsupported wallpaper names." \
-      "${skipped} file(s) contain tabs, newlines, carriage returns, or unsafe path components."
+      "${skipped} file(s) contain tabs, newlines, carriage returns, unit separators, or unsafe path components."
   fi
 
   log INFO "Wallpaper cache built: ${#valid_rels[@]} supported, ${skipped} skipped."
+  return 0
 }
 
 collect_favorites() {
@@ -435,6 +486,8 @@ collect_favorites() {
     seen["$fav"]=1
     favorites_ref+=("$fav")
   done <"$FAVORITES_FILE"
+
+  return 0
 }
 
 write_favorites_file() {
@@ -450,6 +503,7 @@ write_favorites_file() {
   done
 
   mv -f -- "$tmp" "$FAVORITES_FILE"
+  return 0
 }
 
 build_favorites_cache() {
@@ -461,8 +515,8 @@ build_favorites_cache() {
 
   if ((${#favorites[@]} == 0)); then
     rm -f -- "$FAVORITES_CACHE_FILE"
-    notify "No favorites found."
-    log INFO "No favorites found."
+    notify "No liked wallpapers found."
+    log INFO "No liked wallpapers found."
     return 1
   fi
 
@@ -481,6 +535,7 @@ build_favorites_cache() {
 
   mv -f -- "$tmp" "$FAVORITES_CACHE_FILE"
   printf '%s\n' "$FAVORITES_CACHE_FILE"
+  return 0
 }
 
 toggle_favorite() {
@@ -491,13 +546,13 @@ toggle_favorite() {
   local removed=0
 
   is_supported_rel_path "$rel" || {
-    notify "Cannot favorite this wallpaper." "$rel"
+    notify "Cannot like this wallpaper." "$rel"
     log WARN "Rejected favorite toggle for unsupported path: $rel"
     return 1
   }
 
   [[ -f "$WALLPAPER_DIR/$rel" ]] || {
-    notify "Cannot favorite missing wallpaper." "$rel"
+    notify "Cannot like missing wallpaper." "$rel"
     log WARN "Rejected favorite toggle for missing file: $rel"
     return 1
   }
@@ -516,14 +571,16 @@ toggle_favorite() {
     updated+=("$rel")
     write_favorites_file updated
     rm -f -- "$FAVORITES_CACHE_FILE"
-    notify "Added favorite." "$rel"
-    log INFO "Added favorite: $rel"
+    notify "Liked wallpaper." "$rel"
+    log INFO "Liked wallpaper: $rel"
   else
     write_favorites_file updated
     rm -f -- "$FAVORITES_CACHE_FILE"
-    notify "Removed favorite." "$rel"
-    log INFO "Removed favorite: $rel"
+    notify "Removed from Liked." "$rel"
+    log INFO "Unliked wallpaper: $rel"
   fi
+
+  return 0
 }
 
 resolve_path() {
@@ -538,41 +595,66 @@ resolve_path() {
   printf '%s\n' "$full_path"
 }
 
-# --- NEW FUNCTION: Extract active wallpaper directly from daemon ---
+cache_info_by_index() {
+  local input=$1
+  local index=$2
+  local target=$((index + 1))
+
+  gawk -v target="$target" '
+    BEGIN {
+      key = sprintf("%cinfo%c", 31, 31)
+    }
+    NR == target {
+      pos = index($0, key)
+      if (pos == 0) {
+        exit 1
+      }
+      found = 1
+      print substr($0, pos + length(key))
+      exit 0
+    }
+    END {
+      if (!found) {
+        exit 1
+      }
+    }
+  ' "$input"
+}
+
 get_active_wallpaper_filename() {
   local swww_out current_image
-  
-  if swww_out=$(swww query 2>/dev/null | head -n 1); then
-    if [[ "$swww_out" == *image:* ]]; then
-      current_image="${swww_out##*image: }"
-      # Trim leading/trailing whitespace defensively
+
+  if IFS= read -r swww_out < <(swww query 2>/dev/null); then
+    if [[ $swww_out == *image:* ]]; then
+      current_image=${swww_out##*image: }
       current_image="${current_image#"${current_image%%[![:space:]]*}"}"
       current_image="${current_image%"${current_image##*[![:space:]]}"}"
-      
+
       printf '%s\n' "${current_image##*/}"
       return 0
     fi
   fi
+
   return 1
 }
 
-# Modified show_menu to accept an initial selection
 show_menu() {
   local mode=$1
   local input=$2
-  local selection=${3:-} # Injects the active wallpaper filename here
+  local selection=${3:-}
   local prompt message
   local new_selection=""
+  local next_input=""
   local exit_code
   local -a rofi_cmd
 
   while true; do
     if [[ $mode == favorites ]]; then
-      prompt="Favorites"
-      message="Enter: Apply | Alt+U: Unfavorite | Alt+Y: Rebuild | Alt+T: All Wallpapers"
+      prompt="Liked"
+      message="Enter: Apply | Alt+U: Unlike | Alt+Y: Regenerate | Alt+T: Show All"
     else
       prompt="Wallpaper"
-      message="Enter: Apply | Alt+U: Favorite | Alt+Y: Rebuild | Alt+T: Favorites"
+      message="Enter: Apply | Alt+U: Like | Alt+Y: Regenerate | Alt+T: Show Liked"
     fi
 
     rofi_cmd=(
@@ -593,8 +675,6 @@ show_menu() {
       rofi_cmd+=(-theme "$ROFI_THEME")
     fi
 
-    # Rofi uses `-select` to match the display string. 
-    # Because our cache uses ${rel##*/} for display, passing the filename works perfectly.
     if [[ -n $selection ]]; then
       rofi_cmd+=(-select "${selection##*/}")
     fi
@@ -605,8 +685,8 @@ show_menu() {
       exit_code=$?
     fi
 
-    if [[ -n $new_selection && "$new_selection" =~ ^[0-9]+$ ]]; then
-      selection=$(sed -n "$((new_selection + 1))p" "$input" | sed 's/.*\x1finfo\x1f//')
+    if [[ -n $new_selection && $new_selection =~ ^[0-9]+$ ]]; then
+      selection=$(cache_info_by_index "$input" "$new_selection" || true)
     else
       selection=""
     fi
@@ -625,7 +705,9 @@ show_menu() {
         toggle_favorite "$selection" || true
 
         if [[ $mode == favorites ]]; then
-          if ! input=$(build_favorites_cache); then
+          if next_input=$(build_favorites_cache); then
+            input="$next_input"
+          else
             mode="all"
             input="$CACHE_FILE"
             selection=""
@@ -636,28 +718,33 @@ show_menu() {
         build_cache || true
 
         if [[ $mode == favorites ]]; then
-          if ! input=$(build_favorites_cache); then
+          if next_input=$(build_favorites_cache); then
+            input="$next_input"
+          else
             mode="all"
             input="$CACHE_FILE"
             selection=""
           fi
         else
           input="$CACHE_FILE"
-          [[ -s "$input" ]] || return 1
+          [[ -s $input ]] || return 1
         fi
         ;;
       12)
         selection=""
         if [[ $mode == all ]]; then
-          if input=$(build_favorites_cache); then
+          if next_input=$(build_favorites_cache); then
+            input="$next_input"
             mode="favorites"
           else
+            input="$CACHE_FILE"
+            mode="all"
             continue
           fi
         else
           mode="all"
           input="$CACHE_FILE"
-          [[ -s "$input" ]] || return 1
+          [[ -s $input ]] || return 1
         fi
         ;;
       *)
@@ -716,7 +803,12 @@ main() {
   validate_config
   acquire_lock
   ensure_placeholder
+
   ensure_cache
+
+  if ((CACHE_ONLY)); then
+    exit 0
+  fi
 
   if [[ ! -s "$CACHE_FILE" ]]; then
     log INFO "No wallpaper entries to display."
@@ -725,21 +817,22 @@ main() {
 
   local mode="all"
   local input="$CACHE_FILE"
+  local next_input=""
   local selection
   local full_path
   local active_wal=""
 
-  # Fetch the currently rendered image to center the menu
   active_wal=$(get_active_wallpaper_filename) || true
 
   if ((SHOW_FAVORITES)); then
     mode="favorites"
-    if ! input=$(build_favorites_cache); then
+    if next_input=$(build_favorites_cache); then
+      input="$next_input"
+    else
       exit 0
     fi
   fi
 
-  # Pass active_wal as the third argument to seed the selection
   if ! selection=$(show_menu "$mode" "$input" "$active_wal"); then
     log INFO "Menu closed without selection."
     exit 0

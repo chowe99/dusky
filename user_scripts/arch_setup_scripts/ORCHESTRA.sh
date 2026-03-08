@@ -132,6 +132,7 @@ INSTALL_SEQUENCE=(
     "U | 470_vesktop_matugen.sh --auto"
     "U | 475_reverting_sleep_timeout.sh"
     "U | 480_dusky_commands.sh"
+    "S | 485_sudoers_nopassword.sh"
 
 # ------ CUSTOM PATH SCRIPTS -------
 

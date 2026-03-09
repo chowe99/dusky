@@ -46,6 +46,9 @@ declare -ar pkgs_misc=(
     "nemo-pastebin"
 
     # "nemo-terminal"
+
+
+    "satty"
 )
 
 

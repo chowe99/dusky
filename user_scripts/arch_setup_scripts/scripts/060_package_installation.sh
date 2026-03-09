@@ -14,7 +14,7 @@ declare -ar pkgs_graphics=(
 
 # Group 2: Hyprland Core
 declare -ar pkgs_hyprland=(
-  "hyprland" "uwsm" "xorg-xwayland" "xdg-desktop-portal-hyprland" "xdg-desktop-portal-gtk" "xorg-xhost" "polkit" "hyprpolkitagent" "xdg-utils" "socat" "inotify-tools" "file"
+  "hyprland" "uwsm" "xorg-xwayland" "xdg-desktop-portal-hyprland" "xdg-desktop-portal-gtk" "xorg-xhost" "polkit" "hyprpolkitagent" "xdg-utils" "socat" "inotify-tools" "libnotify" "file"
 )
 
 # Group 3: GUI, Toolkits & Fonts
@@ -60,7 +60,7 @@ declare -ar pkgs_dev=(
 
 # Group 10: Multimedia
 declare -ar pkgs_multimedia=(
-  "ffmpeg" "mpv" "mpv-mpris" "swappy" "swayimg" "resvg" "imagemagick" "libheif" "ffmpegthumbnailer" "grim" "slurp" "wl-clipboard" "wl-clip-persist" "cliphist" "tesseract-data-eng"
+  "ffmpeg" "mpv" "mpv-mpris" "satty" "swayimg" "resvg" "imagemagick" "libheif" "ffmpegthumbnailer" "grim" "slurp" "wl-clipboard" "wl-clip-persist" "cliphist" "tesseract-data-eng"
 )
 
 # Group 11: Sys Admin

@@ -33,7 +33,6 @@ input_path  = '/dev/null'
 output_path = '/dev/null'
 post_hook   = '''
    gsettings set org.gnome.desktop.interface icon-theme "Papirus"
-  "$HOME/user_scripts/gtk/papirus_folder_colors.py"
 '''
 
 [templates.qt5ct]

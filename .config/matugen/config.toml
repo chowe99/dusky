@@ -47,12 +47,9 @@ output_path = '~/.config/matugen/generated/qt6ct-colors.conf'
 # System Components (Wayland, Bars, Notifications)
 # -----------------------------------------------------------------------------
 
-# [templates.hyprland]
-# input_path  = '~/.config/matugen/templates/hyprland-colors.conf'
-# output_path = '~/.config/matugen/generated/hyprland-colors.conf'
-# post_hook   = '''
-#  hyprctl reload
-# '''
+[templates.hyprland]
+input_path  = '~/.config/matugen/templates/hyprland-colors.conf'
+output_path = '~/.config/matugen/generated/hyprland-colors.conf'
 
 [templates.hyprlock]
 input_path  = '~/.config/matugen/templates/hyprlock-colors.conf'

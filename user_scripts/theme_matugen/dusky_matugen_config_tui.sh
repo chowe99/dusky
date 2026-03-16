@@ -78,7 +78,7 @@ register_items() {
     register_template 2 "OpenCode"       "opencode"   "false" "opencode"
     register_template 2 "VS Code"        "vscode"     "false" "vscodium"
     register_template 2 "Alacritty"      "alacritty"  "false" "alacritty"
-    register_template 2 "Steam"          "steam"      "false" "steam"
+    register_template 2 "Steam"          "steam"      "false" ""
     register_template 2 "NeoVim"         "neovim"     "true"  "nvim"
     register_template 2 "Zed Editor"     "zed"        "false" "zeditor"
     register_template 2 "Yazi"           "yazi"       "true"  "yazi"
@@ -96,7 +96,7 @@ register_items() {
     register_template 3 "Dump All Matugen Colors" "master_dump" "false" ""
     register_template 3 "Btop"           "btop"       "true" ""
     register_template 3 "Pywalfox"       "pywalfox"   "true" "pywalfox"
-    register_template 3 "Firefox Web Matugen" "firefox_websites"   "true" ""
+    register_template 3 "Firefox Web Matugen" "firefox_websites"   "false" ""
     register_template 3 "Icon Colors"    "papirus_icon_theme"   "false" ""
 }
 

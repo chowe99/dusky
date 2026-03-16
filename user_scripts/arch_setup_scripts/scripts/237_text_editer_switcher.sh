@@ -40,6 +40,7 @@ declare -ra EDITOR_CATALOG=(
     "nano|1|nano.desktop|Nano (Terminal)"
     "code|0|code.desktop|VS Code (GUI)"
     "zeditor|0|dev.zed.Zed.desktop|Zed (GUI)"
+    "vscodium|0|codium.desktop|VS Codium (GUI)"
     "helix|1|helix.desktop|Helix (Terminal)"
     "kate|0|org.kde.kate.desktop|Kate (GUI)"
     "emacs|0|emacs.desktop|Emacs (GUI)"

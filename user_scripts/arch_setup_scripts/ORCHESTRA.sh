@@ -15,6 +15,9 @@
 
 # --- USER CONFIGURATION AREA ---
 
+# REMOVE THIS IN TEH FUTRE!!!!!!!!!!!!!!!!!!!!
+rm -rf /tmp/orchestra_1000.lock
+
 # Directories to search for scripts (in order — first match wins)
 SCRIPT_SEARCH_DIRS=(
     "${HOME}/user_scripts/arch_setup_scripts/scripts"
@@ -31,10 +34,9 @@ POST_SCRIPT_DELAY=0
 INSTALL_SEQUENCE=(
 
 # ------ CUSTOM PATH SCRIPTS -------
-#    "U | deploy_dotfiles.sh --force"
+    "U | deploy_dotfiles.sh --force"
 
 # ------ Setup SCRIPTS -------
-
 
     "U | 005_hypr_custom_config_setup.sh"
     "U | 010_package_removal.sh --auto"
@@ -63,10 +65,13 @@ INSTALL_SEQUENCE=(
     "U | 131_dbus_copy_service_files.sh"
     "U | 135_battery_notify_service.sh --auto"
     "U | 140_fc_cache_fv.sh"
+
+    "U | dusky_matugen_config_tui.sh --smart"
+
     "U | 145_matugen_directories.sh"
     "U | 150_wallpapers_download.sh"
     "U | 155_blur_shadow_opacity.sh"
-    "U | 160_theme_ctl.sh set --defaults"
+    "U | 160_theme_ctl.sh"
     "U | 165_qtct_config.sh"
     "U | 170_waypaper_config_reset.sh"
     "U | 175_animation_default.sh"
@@ -115,6 +120,7 @@ INSTALL_SEQUENCE=(
     "U | 365_cache_purge.sh"
     "S | 370_arch_install_scripts_cleanup.sh"
     "U | 375_cursor_theme_bibata_classic_modern.sh"
+    "U | 376_generate_colorfiles_for_current_wallpaer.sh"
     "U | 380_nvidia_open_source.sh --auto"
     "S | 381_nvidia_services.sh"
 #    "S | 385_waydroid_setup.sh"
@@ -129,7 +135,6 @@ INSTALL_SEQUENCE=(
 #    "S | 430_btrfs_zstd_compression_stats.sh"
 #    "U | 435_key_sound_wayclick_setup.sh --setup"
     "U | 440_config_bat_notify.sh --default"
-    "U | 450_generate_colorfiles_for_current_wallpaer.sh"
     "U | 455_hyprctl_reload.sh"
     "U | 460_switch_clipboard.sh --terminal"
     "S | 465_sddm_setup.sh --auto"
